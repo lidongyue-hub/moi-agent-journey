@@ -237,6 +237,10 @@ class JourneyTests(unittest.TestCase):
             metrics=report['tools']['metrics']; self.assertEqual(
                 {key:metrics[key] for key in ('calls','succeeded','failed','skipped','unknown')},
                 {'calls':5,'succeeded':1,'failed':2,'skipped':1,'unknown':1})
+            self.assertIn('observable_metrics', report)
+            self.assertEqual(report['observable_metrics']['tool']['state'], 'available')
+            self.assertIsNone(report['observable_metrics']['execution']['first_success_tool_round'])
+            self.assertTrue(report['observable_metrics']['environment']['capture_complete'])
             errors={item['call_id']:item for item in report['tools']['errors']}
             self.assertEqual(len(errors['a']['errors']),2)
             self.assertEqual(errors['b']['errors'][0]['request_id'],'r1')
@@ -987,6 +991,8 @@ class JourneyTests(unittest.TestCase):
             self.assertEqual(report['tool_errors'][0]['code'],'upload_denied')
             self.assertEqual(report['tool_errors'][0]['cases'],['J1-01'])
             self.assertEqual(report['task_errors'][0]['reason'],'case_timeout')
+            self.assertIn('observable_metrics', report)
+            self.assertIn('tool', report['observable_metrics'])
             self.assertIn('upload_denied',(destination/'summary.md').read_text())
 
     def test_artifact_scan_never_follows_links_to_runner_files(self):
