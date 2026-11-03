@@ -250,6 +250,74 @@ class JourneyTests(unittest.TestCase):
             self.assertIn('bash',(evidence.root/'case-summary.md').read_text())
             self.assertIn('connection failed',(evidence.root/'case-summary.md').read_text())
 
+    def test_observable_environment_uses_final_timeout_and_blocked_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            timeout_case = Evidence(root / 'J1-01')
+            timeout_case.write('result.json', {'case_id': 'J1-01', 'status': 'timeout', 'capture_complete': True,
+                'tasks': [{'task_id': 'task-1', 'phase': 'office:plan', 'state': 'completed', 'event_count': 3}],
+                'failures': [{'stage': 'execute', 'reason': 'case_timeout'}], 'harness_errors': []})
+            for event in (
+                {'task_id': 'task-1', 'seq': 0, 'kind': 'lifecycle', 'payload': {'type': 'llm_finished', 'call_id': '1'}},
+                {'task_id': 'task-1', 'seq': 1, 'kind': 'tool_call', 'payload': {'tool': 'read_file', 'call_id': 'c1', 'arguments': {'path': 'input.txt'}}},
+                {'task_id': 'task-1', 'seq': 2, 'kind': 'tool_result', 'payload': {'tool': 'read_file', 'call_id': 'c1', 'success': True, 'output': 'ok'}},
+            ):
+                timeout_case.append('events.jsonl', event)
+            timeout_report = finish_case('J1-01', root)
+            self.assertEqual(timeout_report['task']['state'], 'timeout')
+            self.assertEqual(timeout_report['test_status'], 'completed')
+            self.assertTrue(timeout_report['observable_metrics']['environment']['timeout_or_blocked'])
+
+            blocked_case = Evidence(root / 'J2-01')
+            blocked_case.write('result.json', {'case_id': 'J2-01', 'status': 'failed', 'blocked': True,
+                'tasks': [], 'failures': [], 'harness_errors': []})
+            blocked_report = finish_case('J2-01', root)
+            self.assertEqual(blocked_report['functional']['state'], 'blocked')
+            self.assertEqual(blocked_report['observable_metrics']['tool']['state'], 'unavailable')
+            self.assertTrue(blocked_report['observable_metrics']['environment']['timeout_or_blocked'])
+            self.assertEqual(blocked_report['observable_metrics']['environment']['infra_error_count'], 0)
+
+    def test_observable_idle_and_retry_ignore_independent_successful_calls(self):
+        def successful_round(task_id, call_id):
+            return [
+                {'task_id': task_id, 'seq': 0, 'kind': 'lifecycle', 'payload': {'type': 'llm_finished', 'call_id': '1'}},
+                {'task_id': task_id, 'seq': 1, 'kind': 'tool_call', 'payload': {'tool': 'read_file', 'call_id': call_id, 'arguments': {'path': 'input.txt'}}},
+                {'task_id': task_id, 'seq': 2, 'kind': 'tool_result', 'payload': {'tool': 'read_file', 'call_id': call_id, 'success': True, 'output': 'ok'}},
+            ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            parallel = Evidence(root / 'J1-01')
+            parallel.write('result.json', {'case_id': 'J1-01', 'status': 'failed', 'capture_complete': True,
+                'tasks': [
+                    {'task_id': 'task-a', 'phase': 'office:plan', 'state': 'completed', 'event_count': 3},
+                    {'task_id': 'task-b', 'phase': 'office:execute', 'state': 'completed', 'event_count': 3}],
+                'failures': [], 'harness_errors': []})
+            for event in successful_round('task-a', 'a1') + successful_round('task-b', 'b1'):
+                parallel.append('events.jsonl', event)
+            parallel_report = finish_case('J1-01', root)
+            self.assertEqual(parallel_report['test_status'], 'completed')
+            self.assertEqual(parallel_report['tools']['metrics']['succeeded'], 2)
+            self.assertEqual(parallel_report['observable_metrics']['execution']['idle_round_ratio'], 0)
+            self.assertEqual(parallel_report['observable_metrics']['tool']['retry_jitter_ratio'], 0)
+
+            retry = Evidence(root / 'retry' / 'J1-01')
+            retry.write('result.json', {'case_id': 'J1-01', 'status': 'failed', 'capture_complete': True,
+                'tasks': [{'task_id': 'task-1', 'phase': 'office:plan', 'state': 'failed', 'event_count': 5}],
+                'failures': [{'stage': 'session:office', 'reason': 'agent_failed'}], 'harness_errors': []})
+            for event in (
+                {'task_id': 'task-1', 'seq': 0, 'kind': 'lifecycle', 'payload': {'type': 'llm_finished', 'call_id': '1'}},
+                {'task_id': 'task-1', 'seq': 1, 'kind': 'tool_call', 'payload': {'tool': 'read_file', 'call_id': 'c1', 'arguments': {'path': 'input.txt'}}},
+                {'task_id': 'task-1', 'seq': 2, 'kind': 'tool_result', 'payload': {'tool': 'read_file', 'call_id': 'c1', 'success': False, 'status': 'failed', 'error': 'temporary'}},
+                {'task_id': 'task-1', 'seq': 3, 'kind': 'tool_call', 'payload': {'tool': 'read_file', 'call_id': 'c2', 'arguments': {'path': 'input.txt'}}},
+                {'task_id': 'task-1', 'seq': 4, 'kind': 'tool_result', 'payload': {'tool': 'read_file', 'call_id': 'c2', 'success': True, 'output': 'ok'}},
+            ):
+                retry.append('events.jsonl', event)
+            retry_report = finish_case('J1-01', root / 'retry')
+            self.assertEqual(retry_report['task']['state'], 'abnormal')
+            self.assertEqual(retry_report['observable_metrics']['execution']['idle_round_ratio'], 0)
+            self.assertEqual(retry_report['observable_metrics']['tool']['retry_jitter_ratio'], 0.5)
+
     def test_invalid_event_log_is_a_framework_error(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); evidence=Evidence(root/'J1-01', [])

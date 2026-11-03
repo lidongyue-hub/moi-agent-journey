@@ -43,14 +43,16 @@ def _unavailable_tools():
     return {'state': 'unavailable', 'metrics': None, 'errors': [], 'judge_errors': [], 'runtime_sessions': {}}
 
 
-def _unavailable_observable_metrics(reason):
-    return {
-        'plan': {'state': 'unavailable', 'reason': 'insufficient_observability'},
-        'tool': {'state': 'unavailable', 'reason': reason},
-        'memory': {'state': 'unavailable', 'reason': 'no_memory_trace_fields'},
-        'execution': {'state': 'unavailable', 'reason': reason},
-        'environment': {'state': 'available', 'timeout_or_blocked': False, 'infra_error_count': 0, 'capture_complete': False},
-    }
+def _call_signature(call):
+    tool = str(call.get('tool') or 'unknown')
+    arguments = call.get('arguments')
+    if isinstance(arguments, dict):
+        args_key = json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    elif arguments is None:
+        args_key = 'null'
+    else:
+        args_key = str(arguments)
+    return tool, args_key
 
 
 def mark_expected_tool_errors(analysis, checks):
@@ -99,51 +101,57 @@ def _safe_ratio(numerator, denominator):
 
 
 def _tool_retry_jitter_ratio(calls):
-    if not calls:
+    """Share of identified calls that repeat an earlier unsuccessful attempt in the same task.
+
+    Identical successful calls in different tasks, or a later successful repeat of an
+    already successful call, are ordinary work and do not count.
+    """
+    identified = [call for call in calls if call.get('identified')]
+    if not identified:
         return None
-    signatures = Counter()
-    total = 0
-    for call in calls:
-        if not call.get('identified'):
-            continue
-        total += 1
-        tool = str(call.get('tool') or 'unknown')
-        arguments = call.get('arguments')
-        if isinstance(arguments, dict):
-            args_key = json.dumps(arguments, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
-        elif arguments is None:
-            args_key = 'null'
-        else:
-            args_key = str(arguments)
-        signatures[(tool, args_key)] += 1
-    if total == 0:
-        return None
-    repeated = sum(max(0, count - 1) for count in signatures.values())
-    return repeated / total
+    grouped = defaultdict(list)
+    for call in identified:
+        grouped[call.get('task_id')].append(call)
+    retries = 0
+    for task_calls in grouped.values():
+        ordered = sorted(task_calls, key=lambda call: min(call.get('seqs') or [0]))
+        unsuccessful = set()
+        for call in ordered:
+            signature = _call_signature(call)
+            if signature in unsuccessful:
+                retries += 1
+            if call.get('outcome') != 'succeeded':
+                unsuccessful.add(signature)
+    return retries / len(identified)
 
 
-def compute_observable_metrics(result, analysis):
+def compute_observable_metrics(result, analysis=None, unavailable_reason='events_unavailable'):
+    analysis = analysis or {}
     metrics = analysis.get('metrics') or {}
     calls = list(analysis.get('calls') or [])
-    invalid_or_unknown = (metrics.get('failed', 0) + metrics.get('unknown', 0) + metrics.get('skipped', 0))
-    tool = {
-        'state': 'available' if metrics else 'unavailable',
-        'invalid_or_unknown_ratio': _safe_ratio(invalid_or_unknown, metrics.get('calls', 0)),
-        'retry_jitter_ratio': _tool_retry_jitter_ratio(calls),
-    }
-    successful_rounds = [call.get('round') for call in calls
-                         if call.get('outcome') == 'succeeded' and call.get('round') is not None]
-    round_numbers = [number for number in (_round_number(value) for value in successful_rounds) if number is not None]
-    first_success_round = min(round_numbers) if round_numbers else None
-    rounds_total = metrics.get('tool_rounds', 0) if isinstance(metrics.get('tool_rounds'), int) else 0
-    rounds_with_success = {str(call.get('round')) for call in calls
-                           if call.get('outcome') == 'succeeded' and call.get('round') is not None}
-    idle_round_ratio = _safe_ratio(max(0, rounds_total - len(rounds_with_success)), rounds_total)
-    execution = {
-        'state': 'available' if metrics else 'unavailable',
-        'first_success_tool_round': first_success_round,
-        'idle_round_ratio': idle_round_ratio,
-    }
+    if metrics:
+        invalid_or_unknown = (metrics.get('failed', 0) + metrics.get('unknown', 0) + metrics.get('skipped', 0))
+        tool = {
+            'state': 'available',
+            'invalid_or_unknown_ratio': _safe_ratio(invalid_or_unknown, metrics.get('calls', 0)),
+            'retry_jitter_ratio': _tool_retry_jitter_ratio(calls),
+        }
+        successful_rounds = [call.get('round') for call in calls
+                             if call.get('identified') and call.get('outcome') == 'succeeded' and call.get('round') is not None]
+        round_numbers = [number for number in (_round_number(value) for value in successful_rounds) if number is not None]
+        first_success_round = min(round_numbers) if round_numbers else None
+        rounds_total = metrics.get('tool_rounds', 0) if isinstance(metrics.get('tool_rounds'), int) else 0
+        rounds_with_success = {(call.get('task_id'), str(call.get('round'))) for call in calls
+                               if call.get('identified') and call.get('outcome') == 'succeeded' and call.get('round') is not None}
+        idle_round_ratio = _safe_ratio(max(0, rounds_total - len(rounds_with_success)), rounds_total)
+        execution = {
+            'state': 'available',
+            'first_success_tool_round': first_success_round,
+            'idle_round_ratio': idle_round_ratio,
+        }
+    else:
+        tool = {'state': 'unavailable', 'reason': unavailable_reason}
+        execution = {'state': 'unavailable', 'reason': unavailable_reason}
     functional = result.get('functional') if isinstance(result.get('functional'), dict) else {}
     timeout_or_blocked = (result.get('task', {}).get('state') == 'timeout' or
                           functional.get('state') == 'blocked')
@@ -442,24 +450,24 @@ def finish_case(case_id, directory):
           all(item['passed'] for item in checks)):
         result['harness_errors'].append({'stage': 'validation', 'reason': 'contradictory_quality_verdict'})
     events = evidence.root / 'events.jsonl'
+    observed_calls = None
+    unavailable_reason = 'events_unavailable'
     if events.exists():
         try:
             analysis = analyze_events(events, result.get('tasks', []), include_calls=True)
             mark_expected_tool_errors(analysis, checks)
-            result['observable_metrics'] = compute_observable_metrics(result, analysis)
-            analysis.pop('calls', None)
+            observed_calls = analysis.pop('calls', None)
             result['tools'] = {'state': 'available', 'complete': bool(result.get('capture_complete')), **analysis}
         except (OSError, ValueError, TypeError, UnicodeError) as error:
             result['harness_errors'].append({'stage': 'evidence', 'reason': 'invalid_event_log:' + str(error)})
             result['tools'] = _unavailable_tools()
-            result['observable_metrics'] = _unavailable_observable_metrics('invalid_event_log')
+            unavailable_reason = 'invalid_event_log'
     elif any(task.get('event_count', 0) for task in result.get('tasks', [])):
         result['harness_errors'].append({'stage': 'evidence', 'reason': 'recorded_events_missing'})
         result['tools'] = _unavailable_tools()
-        result['observable_metrics'] = _unavailable_observable_metrics('recorded_events_missing')
+        unavailable_reason = 'recorded_events_missing'
     else:
         result['tools'] = _unavailable_tools()
-        result['observable_metrics'] = _unavailable_observable_metrics('events_unavailable')
     result['task'], result['agent'], result['delivery'], result['quality'] = assess(case, result, raw_status)
     result['test_status'] = 'error' if result['harness_errors'] else 'completed'
     if is_functional_case(case):
@@ -472,6 +480,11 @@ def finish_case(case_id, directory):
         else:
             functional_state = 'fail'
         result['functional'] = {'state': functional_state}
+    if result['tools']['state'] == 'available':
+        result['observable_metrics'] = compute_observable_metrics(
+            result, {'metrics': result['tools'].get('metrics'), 'calls': observed_calls or []})
+    else:
+        result['observable_metrics'] = compute_observable_metrics(result, unavailable_reason=unavailable_reason)
     preparation=evidence.root/'preparation.json'
     if preparation.exists():
         result['preparation_seconds']=json.loads(preparation.read_text()).get('seconds')
